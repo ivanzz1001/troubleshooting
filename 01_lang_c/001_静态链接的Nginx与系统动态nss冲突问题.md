@@ -577,3 +577,164 @@ initgroups: files
 ```bash
 /opt/applications/instances/nginx/10.142.80.17/lib/ld-linux-x86-64.so.2 --library-path /opt/applications/instances/nginx/10.142.80.17/lib /opt/applications/instances/nginx/10.142.80.17/bin/nginx_with_libc -e /opt/applications/logs/nginx/nginx/error.log -c /opt/applications/instances/nginx/10.142.80.17/conf/nginx.conf
 ```
+
+## 4. 附录
+
+### 4.1 附录1：如何理解“静态链接的 Nginx 与系统动态 NSS/SSSD 模块冲突”？
+
+简单说：这个 Nginx 把一套 libc“打包进了自己”，但启动 worker 时又临时加载了系统里的另一套 libc，两套运行库混到同一个进程里，最终把内部状态弄坏了。
+
+过程是：
+
+```text
+静态 Nginx 启动 worker
+  ↓
+Nginx 要初始化 root 用户所属的用户组
+  ↓
+调用 initgroups("root")
+  ↓
+系统按 nsswitch.conf 查询：
+files → sss → systemd
+  ↓
+加载 SSSD 的 libnss_sss.so.2
+  ↓
+该模块依赖系统动态 libc.so.6
+  ↓
+进程里出现“内置 libc + 系统 libc”混用
+  ↓
+系统 libc 初始化时读到异常值，发生除零
+  ↓
+worker 收到 SIGFPE 并 core
+```
+
+“静态链接”本来的意思是：Nginx 构建时把 libc 等依赖直接装进自己的二进制，不依赖系统共享库。
+
+但 glibc 有一个特殊机制：用户名、用户组、DNS 等查询会根据 `/etc/nsswitch.conf` 动态加载插件。当前机器配置了：
+
+```text
+group: files sss systemd
+```
+
+> #### 理解 nsswitch.conf 是什么
+> 
+> NSS（Name Service Switch）是 glibc 提供的一套机制，把"查用户/组/主机名"这类操作从具体数据源中解耦。程序调用 getgrnam()、getgrgid() 等函数时，glibc 会读 nsswitch.conf，按配置的顺序逐个询问各个 NSS 模块，直到得到答案。
+
+因此，即便 Nginx 是静态编译的，调用 `initgroups()` 时仍会尝试加载动态的 `libnss_sss.so.2`。这个 SSSD 模块又需要系统的动态 libc，于是发生冲突。
+
+为什么一直 core：
+
+- master 进程能正常启动；
+- master 创建 worker；
+- worker 初始化用户组时崩溃；
+- master 发现 worker 死亡，再创建一个；
+- 新 worker 又走到同一位置崩溃。
+
+所以形成无限循环。
+
+这不是请求流量触发的，也不是某个 location/upstream 配错了。最可靠的解决方式是重新构建或部署一个**动态链接系统 glibc 的 Nginx**。临时绕开 SSSD 查询也可以止住崩溃，但会影响系统的域用户和用户组解析，风险更大。
+
+
+
+### 4.2 附录2： 如何检查systemd-coredump？
+
+检查 socket 状态：
+
+```bash
+systemctl --no-pager --full status systemd-coredump.socket
+```
+
+重点看：
+
+```text
+Active: active (listening)
+```
+
+如果出现：
+
+```text
+Active: failed
+Result: trigger-limit-hit
+Too many incoming connections
+```
+
+说明 core 产生过快，coredump 服务已被限流打挂。
+
+查看相关单元：
+
+```bash
+systemctl list-units --all 'systemd-coredump*'
+```
+
+查看最近日志：
+
+```bash
+journalctl -u systemd-coredump.socket \
+  --since '-1 hour' \
+  --no-pager
+```
+
+查看内核及 coredump 相关错误：
+
+```bash
+journalctl --since '-1 hour' --no-pager |
+grep -Ei 'coredump|core dump|trigger-limit|too many incoming'
+```
+
+查看 Nginx 的 core 记录：
+
+```bash
+coredumpctl --no-pager list nginx
+```
+
+查看某个 core 的详细信息：
+
+```bash
+coredumpctl --no-pager info <PID>
+```
+
+例如：
+
+```bash
+coredumpctl --no-pager info 1953731
+```
+
+重点关注：
+
+```text
+Signal:
+Executable:
+Storage:
+Message:
+```
+
+如果是：
+
+```text
+Signal: 8 (FPE)
+Storage: none
+```
+
+说明记录到了崩溃元数据，但 core 文件本体没有保存。
+
+查看有效配置：
+
+```bash
+systemd-analyze cat-config systemd/coredump.conf
+```
+
+查看 core 文件目录：
+
+```bash
+du -sh /var/lib/systemd/coredump 2>/dev/null
+ls -lh /var/lib/systemd/coredump 2>/dev/null | tail
+```
+
+如果 socket 已经因为 core 风暴失败，在先停止崩溃循环之后，可以恢复它：
+
+```bash
+systemctl reset-failed systemd-coredump.socket
+systemctl start systemd-coredump.socket
+systemctl --no-pager status systemd-coredump.socket
+```
+
+不要在 Nginx 仍高速 core 时反复启动它，否则很快会再次进入 `trigger-limit-hit`。
