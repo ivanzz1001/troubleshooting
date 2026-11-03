@@ -494,3 +494,86 @@ master fork
 
 所以“静态链接的 Nginx 与系统动态 NSS/SSSD 模块冲突”不是只根据 file nginx 得出的经验判断，而是由现场 GDB 调用栈和崩溃指令直接定位出来的。
 
+
+## 3. 修复方案
+
+### 3.1 临时修复方案
+
+临时修复建议：增加独立的`initgroups: files`，让 worker 初始化 root 用户组时只读本地`/etc/group`，不再加载`libnss_sss.so.2`
+
+1）**最快止血方案**
+
+
+```bash
+# cp -a /etc/nsswitch.conf \
+  /etc/nsswitch.conf.bak-nginx-core-20261025
+
+# printf '\n# TEMP workaround for static nginx core\ninitgroups: files\n' \
+  >> /etc/nsswitch.conf
+
+# getent initgroups root
+```
+
+确认输出包含 root 且命令不报错，然后在`nginx.service`恢复后执行：
+
+```bash
+# /opt/applications/instances/nginx/10.142.80.17/bin/nginx \
+  -e /opt/applications/logs/nginx/nginx/error.log \
+  -c /opt/applications/instances/nginx/10.142.80.17/conf/nginx.conf \
+  -t
+
+# systemctl daemon-reload
+# systemctl reset-failed systemd-coredump.socket
+# systemctl start systemd-coredump.socket
+# systemctl restart nginx
+```
+
+启动后检查：
+
+```bash
+# systemctl --no-pager status nginx
+
+# master_pid=$(systemctl show nginx -p MainPID --value)
+# ps --ppid "$master_pid" -o pid,ppid,stat,etimes,cmd
+
+# tail -n 50 /opt/applications/logs/nginx/nginx/error.log
+```
+
+应该能看到稳定存在的 worker，不再出现新的：
+
+```text
+exited on signal 8
+```
+
+2）**影响范围**
+
+这一行只改变“为进程计算补充用户组”的查询源：
+
+```text
+initgroups: files
+```
+普通的 `passwd:` 和 `group:` 查询仍保持 files sss systemd。但新启动的域用户进程将暂时拿不到 SSSD 提供的补充组，可能影响基于域用户组的 sudo、文件权限和登录授权。因此只能作为短期止血。参看[Linux nsswitch.conf 手册](https://www.man7.org/linux/man-pages/man5/nsswitch.conf.5.html)
+
+宿主机使用`glibc 2.34`，修改 `nsswitch.conf` 后会自动重新加载，不需要重启机器。
+
+3）**回滚**
+
+部署动态链接版 Nginx 后：
+
+```bash
+# cp -a /etc/nsswitch.conf.bak-nginx-core-20261025 \
+  /etc/nsswitch.conf
+
+# systemctl restart nginx
+```
+不要把“停止 SSSD”当成临时修复：即使 SSSD 服务停止，glibc 仍可能先加载 libnss_sss.so.2，core 依然可能发生。
+
+### 3.2 终极修复方案
+
+1）**方式1： 重新构建 Nginx，让系统 glibc 动态链接；同时让 worker 使用专用低权限账户**
+
+2）**方式2：保持使用静态链接，让nginx加载正确版本的libc**
+
+```bash
+/opt/applications/instances/nginx/10.142.80.17/lib/ld-linux-x86-64.so.2 --library-path /opt/applications/instances/nginx/10.142.80.17/lib /opt/applications/instances/nginx/10.142.80.17/bin/nginx_with_libc -e /opt/applications/logs/nginx/nginx/error.log -c /opt/applications/instances/nginx/10.142.80.17/conf/nginx.conf
+```
